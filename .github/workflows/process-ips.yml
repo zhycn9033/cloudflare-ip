@@ -172,7 +172,11 @@ jobs:
                       print(f"跳过错误版本地址: {address}")
                       continue
 
-                  result.append(f"{ip}#{center}")
+                  # IPv6 添加 []，IPv4 保持原格式
+                  if version == 6:
+                      result.append(f"[{ip}]#{center}")
+                  else:
+                      result.append(f"{ip}#{center}")
 
               if not result:
                   raise RuntimeError(
@@ -184,6 +188,7 @@ jobs:
 
               print(f"IPv{version} 成功解析 {len(result)} 条地址")
 
+          # 分别解析两个数据源
           parse_file(sys.argv[1], sys.argv[3], 4)
           parse_file(sys.argv[2], sys.argv[4], 6)
           PY
@@ -212,7 +217,7 @@ jobs:
 
           echo "has_changes=$HAS_CHANGES" >> "$GITHUB_ENV"
 
-          echo "数据抓取和处理完成。"
+          echo "IPv4 和 IPv6 数据处理完成。"
 
       # 6. 提交更新
       - name: Commit and Push
@@ -239,6 +244,7 @@ jobs:
 
           git push origin "HEAD:${GITHUB_REF_NAME:-main}"
 
+      # 7. 无变化时跳过提交
       - name: No Changes
         if: env.has_changes == 'false'
         run: echo "IPv4 和 IPv6 均无变化，跳过提交。"
