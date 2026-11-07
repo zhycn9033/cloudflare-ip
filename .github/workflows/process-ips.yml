@@ -59,10 +59,9 @@ jobs:
             exit 1
           fi
 
-          # 解析 IPv4
+          # 解析 IPv4，只输出 IP 地址
           python3 - "$SOURCE_FILE" "$NEW_V4" <<'PY'
           import sys
-          import re
           import ipaddress
 
           source, output_v4 = sys.argv[1:3]
@@ -76,37 +75,31 @@ jobs:
           for line in lines:
               line = line.strip()
 
-              if not line or "#" not in line:
+              if not line:
                   continue
 
-              try:
-                  # 分离 IP 和数据中心信息
-                  address_part, metadata = line.split("#", 1)
+              # 去掉 # 后面的数据中心等信息
+              address_part = line.split("#", 1)[0].strip()
 
-                  address_part = address_part.strip()
-                  metadata = metadata.strip()
+              # 兼容 IPv4:端口格式
+              if ":" in address_part:
+                  address, sep, port = address_part.rpartition(":")
 
-                  if not metadata:
+                  if not sep or not port.isdigit():
                       continue
 
-                  # 提取 IPv4 地址，兼容 IPv4 和 IPv4:端口
-                  try:
-                      ip = ipaddress.ip_address(address_part)
-                  except ValueError:
-                      address, sep, port = address_part.rpartition(":")
+                  address_part = address.strip()
 
-                      if not sep or not port.isdigit():
-                          continue
-
-                      ip = ipaddress.ip_address(address)
+              try:
+                  ip = ipaddress.ip_address(address_part)
 
                   # 只保留 IPv4
                   if ip.version != 4:
                       continue
 
-                  value = f"{ip}#{metadata}"
+                  value = str(ip)
 
-                  # 去重并保留原始顺序
+                  # 去重，保留首次出现顺序
                   if value not in seen_v4:
                       seen_v4.add(value)
                       ipv4_list.append(value)
