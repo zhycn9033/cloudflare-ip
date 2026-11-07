@@ -35,7 +35,7 @@ jobs:
 
           HAS_CHANGES=false
 
-          # IPv4 和 IPv6 数据源
+          # 数据源
           URL_V4="https://www.wetest.vip/page/cloudflare/address_v4.html"
           URL_V6="https://www.wetest.vip/page/cloudflare/address_v6.html"
 
@@ -67,12 +67,14 @@ jobs:
             -H "User-Agent: Mozilla/5.0" \
             "$URL_V6" -o "$HTML_V6"
 
-          # 3. 解析 IPv4 和 IPv6
+          # 3. 解析数据，仅保留 HKG
           python3 - "$HTML_V4" "$HTML_V6" "$NEW_V4" "$NEW_V6" <<'PY'
           import sys
           import ipaddress
           import re
           from html.parser import HTMLParser
+
+          TARGET_DC = "HKG"
 
           class DataParser(HTMLParser):
               VOID_TAGS = {
@@ -160,35 +162,54 @@ jobs:
                   )
 
               result = []
+              seen = set()
 
               for address, center in zip(addresses, centers):
+
+                  # 只保留 HKG 数据中心
+                  center = center.strip().upper()
+
+                  if center != TARGET_DC:
+                      continue
+
+                  # 验证 IP 地址
                   try:
                       ip = ipaddress.ip_address(address.strip())
                   except ValueError:
                       print(f"跳过无效地址: {address}")
                       continue
 
+                  # 验证 IP 版本
                   if ip.version != version:
                       print(f"跳过错误版本地址: {address}")
                       continue
 
-                  # IPv6 添加 []，IPv4 保持原格式
+                  # 去重
+                  if str(ip) in seen:
+                      continue
+
+                  seen.add(str(ip))
+
+                  # IPv6 使用 [] 包裹
                   if version == 6:
-                      result.append(f"[{ip}]#{center}")
+                      result.append(f"[{ip}]#{TARGET_DC}")
                   else:
-                      result.append(f"{ip}#{center}")
+                      result.append(f"{ip}#{TARGET_DC}")
 
               if not result:
                   raise RuntimeError(
-                      f"IPv{version} 没有有效地址"
+                      f"IPv{version} 没有找到有效的 {TARGET_DC} 地址，保护原文件"
                   )
 
               with open(output, "w", encoding="utf-8") as f:
                   f.write("\n".join(result) + "\n")
 
-              print(f"IPv{version} 成功解析 {len(result)} 条地址")
+              print(
+                  f"IPv{version} 成功获取 "
+                  f"{len(result)} 条 {TARGET_DC} 地址"
+              )
 
-          # 分别解析两个数据源
+          # 分别处理 IPv4 和 IPv6
           parse_file(sys.argv[1], sys.argv[3], 4)
           parse_file(sys.argv[2], sys.argv[4], 6)
           PY
@@ -199,9 +220,9 @@ jobs:
 
             cp "$NEW_V4" "wetest/ipv4.txt"
             HAS_CHANGES=true
-            echo "IPv4 数据已更新。"
+            echo "IPv4 HKG 数据已更新。"
           else
-            echo "IPv4 数据没有变化。"
+            echo "IPv4 HKG 数据没有变化。"
           fi
 
           # 5. 更新 IPv6 文件
@@ -210,14 +231,14 @@ jobs:
 
             cp "$NEW_V6" "wetest/ipv6.txt"
             HAS_CHANGES=true
-            echo "IPv6 数据已更新。"
+            echo "IPv6 HKG 数据已更新。"
           else
-            echo "IPv6 数据没有变化。"
+            echo "IPv6 HKG 数据没有变化。"
           fi
 
           echo "has_changes=$HAS_CHANGES" >> "$GITHUB_ENV"
 
-          echo "IPv4 和 IPv6 数据处理完成。"
+          echo "IPv4 和 IPv6 HKG 数据处理完成。"
 
       # 6. 提交更新
       - name: Commit and Push
@@ -238,7 +259,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "WeTest IPv4 & IPv6 $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+          git commit -m "WeTest HKG IPv4 & IPv6 $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
 
           git pull --rebase origin "${GITHUB_REF_NAME:-main}"
 
@@ -247,4 +268,4 @@ jobs:
       # 7. 无变化时跳过提交
       - name: No Changes
         if: env.has_changes == 'false'
-        run: echo "IPv4 和 IPv6 均无变化，跳过提交。"
+        run: echo "HKG IPv4 和 IPv6 均无变化，跳过提交。"
