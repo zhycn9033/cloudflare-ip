@@ -1,0 +1,244 @@
+
+name: process-ips
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: process-ips
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch and Process WeTest IPv4 & IPv6
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p wetest
+
+          TMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          HAS_CHANGES=false
+
+          # IPv4 和 IPv6 数据源
+          URL_V4="https://www.wetest.vip/page/cloudflare/address_v4.html"
+          URL_V6="https://www.wetest.vip/page/cloudflare/address_v6.html"
+
+          # 临时文件
+          HTML_V4="$TMP_DIR/ipv4.html"
+          HTML_V6="$TMP_DIR/ipv6.html"
+          NEW_V4="$TMP_DIR/ipv4.txt"
+          NEW_V6="$TMP_DIR/ipv6.txt"
+
+          # 1. 抓取 IPv4
+          echo "正在抓取 WeTest IPv4..."
+
+          curl -fsSL \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --retry 3 \
+            --retry-delay 2 \
+            -H "User-Agent: Mozilla/5.0" \
+            "$URL_V4" -o "$HTML_V4"
+
+          # 2. 抓取 IPv6
+          echo "正在抓取 WeTest IPv6..."
+
+          curl -fsSL \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --retry 3 \
+            --retry-delay 2 \
+            -H "User-Agent: Mozilla/5.0" \
+            "$URL_V6" -o "$HTML_V6"
+
+          # 3. 解析 IPv4 和 IPv6
+          python3 - "$HTML_V4" "$HTML_V6" "$NEW_V4" "$NEW_V6" <<'PY'
+          import sys
+          import ipaddress
+          import re
+          from html.parser import HTMLParser
+
+          class DataParser(HTMLParser):
+              VOID_TAGS = {
+                  "area", "base", "br", "col", "embed",
+                  "hr", "img", "input", "link", "meta",
+                  "param", "source", "track", "wbr"
+              }
+
+              def __init__(self):
+                  super().__init__()
+                  self.records = []
+                  self.current = None
+
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  label = attrs.get("data-label")
+
+                  if self.current is None:
+                      if label in ("线路名称", "优选地址", "数据中心"):
+                          self.current = {
+                              "label": label,
+                              "depth": 1,
+                              "text": []
+                          }
+                  elif tag not in self.VOID_TAGS:
+                      self.current["depth"] += 1
+
+              def handle_startendtag(self, tag, attrs):
+                  pass
+
+              def handle_endtag(self, tag):
+                  if self.current is None:
+                      return
+
+                  if tag not in self.VOID_TAGS:
+                      self.current["depth"] -= 1
+
+                  if self.current["depth"] <= 0:
+                      self.records.append(self.current)
+                      self.current = None
+
+              def handle_data(self, data):
+                  if self.current is not None:
+                      self.current["text"].append(data)
+
+          def parse_file(source, output, version):
+              parser = DataParser()
+
+              with open(source, encoding="utf-8") as f:
+                  parser.feed(f.read())
+
+              fields = {
+                  "线路名称": [],
+                  "优选地址": [],
+                  "数据中心": []
+              }
+
+              for item in parser.records:
+                  value = re.sub(
+                      r"\s+", " ",
+                      "".join(item["text"])
+                  ).strip()
+
+                  if value:
+                      fields[item["label"]].append(value)
+
+              addresses = fields["优选地址"]
+              centers = fields["数据中心"]
+
+              if not addresses:
+                  raise RuntimeError(
+                      f"IPv{version} 没有解析到任何地址"
+                  )
+
+              if len(addresses) != len(centers):
+                  raise RuntimeError(
+                      f"IPv{version} 地址和数据中心数量不一致"
+                  )
+
+              lines = fields["线路名称"]
+
+              if lines and len(lines) != len(addresses):
+                  raise RuntimeError(
+                      f"IPv{version} 线路名称数量不一致"
+                  )
+
+              result = []
+
+              for address, center in zip(addresses, centers):
+                  try:
+                      ip = ipaddress.ip_address(address.strip())
+                  except ValueError:
+                      print(f"跳过无效地址: {address}")
+                      continue
+
+                  if ip.version != version:
+                      print(f"跳过错误版本地址: {address}")
+                      continue
+
+                  result.append(f"{ip}#{center}")
+
+              if not result:
+                  raise RuntimeError(
+                      f"IPv{version} 没有有效地址"
+                  )
+
+              with open(output, "w", encoding="utf-8") as f:
+                  f.write("\n".join(result) + "\n")
+
+              print(f"IPv{version} 成功解析 {len(result)} 条地址")
+
+          parse_file(sys.argv[1], sys.argv[3], 4)
+          parse_file(sys.argv[2], sys.argv[4], 6)
+          PY
+
+          # 4. 更新 IPv4 文件
+          if [ ! -f "wetest/ipv4.txt" ] || \
+             ! cmp -s "wetest/ipv4.txt" "$NEW_V4"; then
+
+            cp "$NEW_V4" "wetest/ipv4.txt"
+            HAS_CHANGES=true
+            echo "IPv4 数据已更新。"
+          else
+            echo "IPv4 数据没有变化。"
+          fi
+
+          # 5. 更新 IPv6 文件
+          if [ ! -f "wetest/ipv6.txt" ] || \
+             ! cmp -s "wetest/ipv6.txt" "$NEW_V6"; then
+
+            cp "$NEW_V6" "wetest/ipv6.txt"
+            HAS_CHANGES=true
+            echo "IPv6 数据已更新。"
+          else
+            echo "IPv6 数据没有变化。"
+          fi
+
+          echo "has_changes=$HAS_CHANGES" >> "$GITHUB_ENV"
+
+          echo "数据抓取和处理完成。"
+
+      # 6. 提交更新
+      - name: Commit and Push
+        if: env.has_changes == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git config --local user.email \
+            "github-actions[bot]@users.noreply.github.com"
+
+          git config --local user.name "github-actions[bot]"
+
+          git add wetest/ipv4.txt wetest/ipv6.txt
+
+          if git diff --cached --quiet; then
+            echo "没有需要提交的变化。"
+            exit 0
+          fi
+
+          git commit -m "WeTest IPv4 & IPv6 $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+
+          git pull --rebase origin "${GITHUB_REF_NAME:-main}"
+
+          git push origin "HEAD:${GITHUB_REF_NAME:-main}"
+
+      - name: No Changes
+        if: env.has_changes == 'false'
+        run: echo "IPv4 和 IPv6 均无变化，跳过提交。"
