@@ -1,8 +1,8 @@
+
 name: process-ips
 
 on:
   schedule:
-    # 每 3 小时运行一次
     - cron: '0 */3 * * *'
   workflow_dispatch:
 
@@ -18,14 +18,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. 检出仓库
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2. 抓取数据并查询 IP 归属地
-      - name: Fetch and Process IPv4
+      - name: Fetch, Test and Geolocate IPv4 & IPv6
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -35,113 +33,262 @@ jobs:
           TMP_DIR=$(mktemp -d)
           trap 'rm -rf "$TMP_DIR"' EXIT
 
-          SOURCE_URL="https://raw.githubusercontent.com/200111226011qw-debug/cf-ip-screener/refs/heads/main/result/clean-ips.txt"
-
-          SOURCE_FILE="$TMP_DIR/clean-ips.txt"
-          NEW_V4="$TMP_DIR/ipv4.txt"
-
           HAS_CHANGES=false
 
-          # 抓取数据源
-          echo "正在抓取 Cloudflare IP 数据..."
+          URL_V4="https://www.wetest.vip/page/cloudflare/address_v4.html"
+          URL_V6="https://www.wetest.vip/page/cloudflare/address_v6.html"
+
+          HTML_V4="$TMP_DIR/ipv4.html"
+          HTML_V6="$TMP_DIR/ipv6.html"
+
+          NEW_V4="$TMP_DIR/ipv4.txt"
+          NEW_V6="$TMP_DIR/ipv6.txt"
+
+          echo "正在抓取 WeTest IPv4..."
 
           curl -fsSL \
             --connect-timeout 10 \
-            --max-time 60 \
+            --max-time 30 \
             --retry 3 \
             --retry-delay 2 \
             -H "User-Agent: Mozilla/5.0" \
-            "$SOURCE_URL" \
-            -o "$SOURCE_FILE"
+            "$URL_V4" -o "$HTML_V4"
 
-          if [ ! -s "$SOURCE_FILE" ]; then
-            echo "错误：数据源为空。"
-            exit 1
-          fi
+          echo "正在抓取 WeTest IPv6..."
 
-          # 解析 IPv4 并查询归属地
-          python3 - "$SOURCE_FILE" "$NEW_V4" <<'PY'
+          curl -fsSL \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --retry 3 \
+            --retry-delay 2 \
+            -H "User-Agent: Mozilla/5.0" \
+            "$URL_V6" -o "$HTML_V6"
+
+          python3 - "$HTML_V4" "$HTML_V6" "$NEW_V4" "$NEW_V6" <<'PY'
           import sys
+          import ipaddress
           import re
           import json
+          import socket
           import time
-          import ipaddress
           import urllib.request
-          import urllib.error
+          import urllib.parse
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from html.parser import HTMLParser
 
-          source, output_file = sys.argv[1:3]
+          # ==============================
+          # 配置
+          # ==============================
 
-          ipv4_list = []
-          seen = set()
+          TEST_TIMEOUT = 3
+          MAX_WORKERS = 40
+          BATCH_SIZE = 100
+          GEO_API = "http://ip-api.com/batch"
 
-          # 1. 提取 IPv4
-          with open(source, "r", encoding="utf-8") as f:
-              lines = f.readlines()
+          # ==============================
+          # HTML解析
+          # ==============================
 
-          for line in lines:
-              line = line.strip()
+          class DataParser(HTMLParser):
+              VOID_TAGS = {
+                  "area", "base", "br", "col", "embed",
+                  "hr", "img", "input", "link", "meta",
+                  "param", "source", "track", "wbr"
+              }
 
-              if not line:
-                  continue
+              def __init__(self):
+                  super().__init__()
+                  self.records = []
+                  self.current = None
 
-              # 去掉 # 后面的数据中心信息
-              address = line.split("#", 1)[0].strip()
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  label = attrs.get("data-label")
 
-              # 兼容 IPv4:端口
-              if ":" in address:
-                  ip_part, sep, port = address.rpartition(":")
+                  if self.current is None:
+                      if label in ("线路名称", "优选地址", "数据中心"):
+                          self.current = {
+                              "label": label,
+                              "depth": 1,
+                              "text": []
+                          }
+                  elif tag not in self.VOID_TAGS:
+                      self.current["depth"] += 1
 
-                  if not sep or not port.isdigit():
+              def handle_startendtag(self, tag, attrs):
+                  pass
+
+              def handle_endtag(self, tag):
+                  if self.current is None:
+                      return
+
+                  if tag not in self.VOID_TAGS:
+                      self.current["depth"] -= 1
+
+                  if self.current["depth"] <= 0:
+                      self.records.append(self.current)
+                      self.current = None
+
+              def handle_data(self, data):
+                  if self.current is not None:
+                      self.current["text"].append(data)
+
+          def parse_source(source, version):
+              parser = DataParser()
+
+              with open(source, encoding="utf-8") as f:
+                  parser.feed(f.read())
+
+              fields = {
+                  "线路名称": [],
+                  "优选地址": [],
+                  "数据中心": []
+              }
+
+              for item in parser.records:
+                  value = re.sub(
+                      r"\s+", " ",
+                      "".join(item["text"])
+                  ).strip()
+
+                  if value:
+                      fields[item["label"]].append(value)
+
+              addresses = fields["优选地址"]
+              centers = fields["数据中心"]
+              lines = fields["线路名称"]
+
+              if not addresses:
+                  raise RuntimeError(
+                      f"IPv{version} 没有解析到地址"
+                  )
+
+              if len(addresses) != len(centers):
+                  raise RuntimeError(
+                      f"IPv{version} 地址和数据中心数量不一致"
+                  )
+
+              if lines and len(lines) != len(addresses):
+                  raise RuntimeError(
+                      f"IPv{version} 线路名称数量不一致"
+                  )
+
+              records = []
+              seen = set()
+
+              for address, center in zip(addresses, centers):
+                  try:
+                      ip = ipaddress.ip_address(address.strip())
+                  except ValueError:
+                      print(f"无效地址，跳过: {address}")
                       continue
 
-                  address = ip_part.strip()
-
-              try:
-                  ip = ipaddress.ip_address(address)
-
-                  # 只保留 IPv4
-                  if ip.version != 4:
+                  if ip.version != version:
                       continue
 
-                  ip = str(ip)
+                  ip_text = str(ip)
 
-                  # 去重，保留原始顺序
-                  if ip not in seen:
-                      seen.add(ip)
-                      ipv4_list.append(ip)
+                  if ip_text in seen:
+                      continue
 
-              except ValueError:
-                  print(f"跳过无效数据: {line}")
+                  seen.add(ip_text)
 
-          if not ipv4_list:
-              raise SystemExit("错误：没有解析到有效 IPv4，保留原文件。")
+                  records.append({
+                      "ip": ip_text,
+                      "center": center.strip(),
+                      "version": version
+                  })
 
-          print(f"成功提取 IPv4：{len(ipv4_list)} 条")
-
-          # 2. IP 归属地查询
-          API_URL = "http://ip-api.com/batch?fields=status,message,country,query&lang=zh-CN"
-
-          country_map = {}
-
-          # 每批最多 100 个 IP
-          batches = [
-              ipv4_list[i:i + 100]
-              for i in range(0, len(ipv4_list), 100)
-          ]
-
-          print(f"需要查询 {len(batches)} 批 IP 归属地")
-
-          for batch_index, batch in enumerate(batches, 1):
+              if not records:
+                  raise RuntimeError(
+                      f"IPv{version} 没有有效地址"
+                  )
 
               print(
-                  f"正在查询第 {batch_index}/{len(batches)} 批，"
-                  f"共 {len(batch)} 个 IP..."
+                  f"IPv{version} 初始地址数量: {len(records)}"
               )
 
-              payload = json.dumps(batch).encode("utf-8")
+              return records
+
+          # ==============================
+          # TCP 443 可用性测试
+          # ==============================
+
+          def test_ip(ip_text):
+              start = time.monotonic()
+
+              try:
+                  ip = ipaddress.ip_address(ip_text)
+
+                  with socket.create_connection(
+                      (str(ip), 443),
+                      timeout=TEST_TIMEOUT
+                  ):
+                      elapsed = (
+                          time.monotonic() - start
+                      ) * 1000
+
+                      return ip_text, True, round(elapsed)
+
+              except (OSError, ValueError, TimeoutError):
+                  return ip_text, False, None
+
+          def test_all(records):
+              print("\n开始 TCP 443 可用性测试...")
+
+              results = {}
+
+              with ThreadPoolExecutor(
+                  max_workers=MAX_WORKERS
+              ) as executor:
+
+                  futures = {
+                      executor.submit(
+                          test_ip, item["ip"]
+                      ): item["ip"]
+                      for item in records
+                  }
+
+                  for future in as_completed(futures):
+                      ip, success, latency = future.result()
+
+                      results[ip] = (success, latency)
+
+              alive = [
+                  item for item in records
+                  if results[item["ip"]][0]
+              ]
+
+              for item in alive:
+                  item["latency"] = results[item["ip"]][1]
+
+              failed = len(records) - len(alive)
+
+              print(f"测试总数: {len(records)}")
+              print(f"可用数量: {len(alive)}")
+              print(f"不可用数量: {failed}")
+
+              return alive
+
+          # ==============================
+          # 批量查询 IP 归属地
+          # ==============================
+
+          def query_geolocation(ips):
+              params = urllib.parse.urlencode({
+                  "fields": "status,message,query,country,regionName,city",
+                  "lang": "zh-CN"
+              })
+
+              url = f"{GEO_API}?{params}"
+
+              payload = json.dumps(
+                  ips,
+                  ensure_ascii=False
+              ).encode("utf-8")
 
               request = urllib.request.Request(
-                  API_URL,
+                  url,
                   data=payload,
                   headers={
                       "Content-Type": "application/json",
@@ -150,97 +297,188 @@ jobs:
                   method="POST"
               )
 
-              response_data = None
-
-              # 失败时最多重试 3 次
               for attempt in range(3):
                   try:
                       with urllib.request.urlopen(
-                          request, timeout=60
+                          request,
+                          timeout=30
                       ) as response:
-                          response_data = json.loads(
+                          data = json.loads(
                               response.read().decode("utf-8")
                           )
 
-                      break
+                      result = {}
 
-                  except urllib.error.HTTPError as e:
-                      print(f"API HTTP 错误：{e.code}")
+                      for item in data:
+                          if item.get("status") != "success":
+                              continue
 
-                      if e.code == 429:
-                          wait_time = 65
-                          print(f"触发限流，等待 {wait_time} 秒后重试...")
-                          time.sleep(wait_time)
-                          continue
+                          ip = item.get("query")
 
-                      raise
+                          if not ip:
+                              continue
+
+                          parts = [
+                              item.get("country", ""),
+                              item.get("regionName", ""),
+                              item.get("city", "")
+                          ]
+
+                          location = "-".join(
+                              dict.fromkeys(
+                                  p.strip()
+                                  for p in parts
+                                  if p and p.strip()
+                              )
+                          )
+
+                          result[ip] = (
+                              location or "归属地未知"
+                          )
+
+                      return result
 
                   except Exception as e:
-                      print(f"查询失败：{e}")
+                      print(
+                          f"归属地查询失败 "
+                          f"({attempt + 1}/3): {e}"
+                      )
 
                       if attempt < 2:
-                          time.sleep(10)
-                      else:
-                          raise
+                          time.sleep(5)
 
-              if response_data is None:
-                  raise SystemExit("错误：归属地查询失败，保留原文件。")
+              return {}
 
-              if not isinstance(response_data, list):
-                  raise SystemExit("错误：API 返回格式异常。")
+          def get_all_locations(records):
+              unique_ips = list(dict.fromkeys(
+                  item["ip"] for item in records
+              ))
 
-              # 解析查询结果
-              for item in response_data:
-                  if item.get("status") != "success":
-                      raise SystemExit(
-                          f"IP 查询失败：{item.get('query')} "
-                          f"{item.get('message', '')}"
-                      )
+              locations = {}
 
-                  ip = item.get("query")
-                  country = item.get("country")
-
-                  if not ip or not country:
-                      raise SystemExit(
-                          f"错误：IP {ip} 未获得有效归属地。"
-                      )
-
-                  country_map[ip] = country
-
-              # IP-API 免费接口限制为每分钟 15 次
-              # 每完成 15 批后等待，避免触发限流
-              if batch_index % 15 == 0 and batch_index < len(batches):
-                  print("已完成 15 次查询，等待 65 秒...")
-                  time.sleep(65)
-
-          # 3. 检查查询结果是否完整
-          missing = [
-              ip for ip in ipv4_list
-              if ip not in country_map
-          ]
-
-          if missing:
-              raise SystemExit(
-                  f"错误：有 {len(missing)} 个 IP 未获得归属地，"
-                  "保留原文件。"
+              print(
+                  f"\n开始查询 IP 归属地: {len(unique_ips)} 个"
               )
 
-          # 4. 生成最终文件
-          result = []
+              batches = [
+                  unique_ips[i:i + BATCH_SIZE]
+                  for i in range(0, len(unique_ips), BATCH_SIZE)
+              ]
 
-          for ip in ipv4_list:
-              country = country_map[ip]
-              result.append(f"{ip}#{country}")
+              for index, batch in enumerate(batches, 1):
+                  print(
+                      f"查询批次 {index}/{len(batches)}"
+                  )
 
-          with open(output_file, "w", encoding="utf-8") as f:
-              f.write("\n".join(result) + "\n")
+                  result = query_geolocation(batch)
+                  locations.update(result)
 
-          print(f"归属地查询完成：{len(result)} 条")
-          print("最终输出结果：")
-          print("\n".join(result))
+                  if index < len(batches):
+                      time.sleep(2)
+
+              for ip in unique_ips:
+                  if ip not in locations:
+                      locations[ip] = "归属地未知"
+
+              return locations
+
+          # ==============================
+          # 输出文件
+          # ==============================
+
+          def write_output(records, locations, output, version):
+              result = []
+
+              for item in records:
+                  ip = item["ip"]
+                  center = item["center"]
+                  location = locations.get(
+                      ip,
+                      "归属地未知"
+                  )
+
+                  # IPv6 添加方括号
+                  if version == 6:
+                      ip = f"[{ip}]"
+
+                  result.append(
+                      f"{ip}#{center}#{location}"
+                  )
+
+              with open(
+                  output,
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  f.write("\n".join(result) + "\n")
+
+              print(
+                  f"IPv{version} 最终输出: {len(result)} 条"
+              )
+
+          # ==============================
+          # 主程序
+          # ==============================
+
+          v4_records = parse_source(sys.argv[1], 4)
+          v6_records = parse_source(sys.argv[2], 6)
+
+          all_records = v4_records + v6_records
+
+          # 测试 TCP 443
+          alive_records = test_all(all_records)
+
+          if not alive_records:
+              raise RuntimeError(
+                  "所有 IP 均测试失败，停止更新文件"
+              )
+
+          # 查询归属地
+          locations = get_all_locations(alive_records)
+
+          # 分别输出
+          alive_v4 = [
+              item for item in alive_records
+              if item["version"] == 4
+          ]
+
+          alive_v6 = [
+              item for item in alive_records
+              if item["version"] == 6
+          ]
+
+          if not alive_v4:
+              raise RuntimeError(
+                  "没有可用 IPv4，停止更新"
+              )
+
+          if not alive_v6:
+              raise RuntimeError(
+                  "没有可用 IPv6，停止更新"
+              )
+
+          write_output(
+              alive_v4,
+              locations,
+              sys.argv[3],
+              4
+          )
+
+          write_output(
+              alive_v6,
+              locations,
+              sys.argv[4],
+              6
+          )
+
+          print("\n所有 IP 测试及归属地标记完成。")
+
           PY
 
-          # 5. 比较新旧文件
+          # ==============================
+          # 更新 IPv4
+          # ==============================
+
           if [ ! -f "wetest/ipv4.txt" ] || \
              ! cmp -s "wetest/ipv4.txt" "$NEW_V4"; then
 
@@ -251,11 +489,28 @@ jobs:
             echo "IPv4 数据没有变化。"
           fi
 
+          # ==============================
+          # 更新 IPv6
+          # ==============================
+
+          if [ ! -f "wetest/ipv6.txt" ] || \
+             ! cmp -s "wetest/ipv6.txt" "$NEW_V6"; then
+
+            cp "$NEW_V6" "wetest/ipv6.txt"
+            HAS_CHANGES=true
+            echo "IPv6 数据已更新。"
+          else
+            echo "IPv6 数据没有变化。"
+          fi
+
           echo "has_changes=$HAS_CHANGES" >> "$GITHUB_ENV"
 
-          echo "IPv4 数据处理完成。"
+          echo "IPv4 和 IPv6 处理完成。"
 
-      # 6. 有变化时提交并推送
+      # ==============================
+      # 提交更新
+      # ==============================
+
       - name: Commit and Push
         if: env.has_changes == 'true'
         shell: bash
@@ -267,20 +522,23 @@ jobs:
 
           git config --local user.name "github-actions[bot]"
 
-          git add wetest/ipv4.txt
+          git add wetest/ipv4.txt wetest/ipv6.txt
 
           if git diff --cached --quiet; then
             echo "没有需要提交的变化。"
             exit 0
           fi
 
-          git commit -m "Update IPv4 $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+          git commit -m "WeTest IPv4 & IPv6 $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
 
           git pull --rebase origin "${GITHUB_REF_NAME:-main}"
 
           git push origin "HEAD:${GITHUB_REF_NAME:-main}"
 
-      # 7. 无变化时跳过提交
+      # ==============================
+      # 无变化
+      # ==============================
+
       - name: No Changes
         if: env.has_changes == 'false'
-        run: echo "IPv4 数据没有变化，跳过提交。"
+        run: echo "IPv4 和 IPv6 均无变化，跳过提交。"
